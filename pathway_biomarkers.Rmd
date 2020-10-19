@@ -1,0 +1,180 @@
+---
+title: "Pathway biomarker analysis"
+output:
+  rmdformats::readthedown:
+    self_contained: true
+    thumbnails: false
+    lightbox: true
+    gallery: false
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr);
+library(tidyr);
+library(mvtnorm);
+library(caret);
+library(pROC);
+library(parallel)
+load(file = "pathways.rda")
+filter(pathways, Term == "Classical Complement Pathway_Homo sapiens_h_classicPathway") %>% 
+  unnest(Genes)
+```
+
+## Simulation of pathway data
+* see caret tutorial here: [caret](https://topepo.github.io/caret/model-training-and-tuning.html)
+
+```{r}
+samples_in_each_group = c(20, 200);
+number_of_groups <- 2
+all_genes <- unique(unlist(pathways$Genes))
+length(all_genes); ## total number of genes
+
+## Suppose that the complement pathway is predictive of the disease
+truth <- filter(pathways, Term == "Classical Complement Pathway_Homo sapiens_h_classicPathway")
+truth_genes <- truth$Genes$`Classical Complement Pathway_Homo sapiens_h_classicPathway`
+
+## group1
+n <- length(truth_genes)  
+A <- matrix(runif(n^2)*2-1, ncol=n) 
+Sigma <- t(A) %*% A
+## gene expression data
+expList <- lapply(samples_in_each_group, function(i){
+  exp <- matrix(rnorm(i*number_of_groups*length(all_genes)), 
+                nrow = i*number_of_groups, 
+                ncol=length(truth_genes)+(length(all_genes) - length(truth_genes)))
+  ## modify the expression of the truth genes in group 1
+  exp[1:i, 1:length(truth_genes)] <- rmvnorm(n=i, mean=rep(0.5, length(truth_genes)))
+  exp <- as.data.frame(exp)
+  colnames(exp) <- c(truth_genes, setdiff(all_genes, truth_genes))
+  ## class vector
+  exp$Class <- rep(c("Group1", "Group2"), each = i)
+  exp
+})
+
+```
+
+## Split data into train and test
+
+```{r}
+set.seed(3456)
+inTraining <- lapply(expList, function(i){ createDataPartition(i$Class, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)})
+mapply(function(x, y){
+  table(x$Class[y])
+}, x = expList, y = inTraining, SIMPLIFY = FALSE)
+
+
+training <- mapply(function(x, y){
+  x[y, ]
+}, x = expList, y = inTraining, SIMPLIFY = FALSE)
+testing <- mapply(function(x, y){
+  x[-y, ]
+}, x = expList, y = inTraining, SIMPLIFY = FALSE)
+
+
+
+```
+
+## Determine the AUC per Pathway
+
+```{r}
+fitControl <- trainControl(## 5-fold CV
+                           method = "repeatedcv",
+                           number = 5,
+                           ## repeated five times
+                           repeats = 5,
+                           ## Estimate class probabilities
+                           classProbs = TRUE,
+                           ## Evaluate performance using 
+                           ## the following function
+                           summaryFunction = twoClassSummary)
+
+glmnetGrid <-  expand.grid(alpha = 0,
+                           lambda = seq(0.001, 0.01, length.out = 5))
+
+
+no_cores <- detectCores() # number of cores on machine
+clust <- makeCluster(no_cores)
+clusterExport(clust, varlist=c("training", "testing"))
+clusterExport(clust, varlist=c("fitControl", "glmnetGrid"))
+result <- parLapply(clust, pathways$Genes, function(pathway){
+  library(caret); library(pROC); library(dplyr);
+  mapply(function(train, test){
+    glmnetFit <- train(Class ~ ., data = train[, c(pathway, "Class")], 
+                 method = "glmnet", 
+                 trControl = fitControl, 
+                 verbose = FALSE, 
+                 ## Now specify the exact models 
+                 ## to evaluate:
+                 tuneGrid = glmnetGrid, 
+                 preProc = c("center", "scale"),
+                 metric = "ROC")
+    bestModel <- glmnetFit$results %>% filter(ROC == max(ROC)) %>% slice(1)
+    pred <- predict(glmnetFit, newdata = test[, c(pathway, "Class")], type = "prob")
+    auc <- roc(test$Class, pred$Group2, auc = TRUE, direction = "<")
+    data.frame(train = bestModel$ROC, test = as.numeric(auc$auc), n_train = nrow(train))
+  }, train = training, test=testing, SIMPLIFY = FALSE) %>% 
+    do.call(rbind, .)
+}) %>% 
+  do.call(rbind, .)
+stopCluster(clust)
+```
+
+## Plot test AUCs for each pathway
+
+```{r}
+result %>% 
+  mutate(pathway = rownames(.)) %>% 
+  filter(train > 0.75) %>% 
+  mutate(pathway = sapply(strsplit(pathway, "_"), function(i){i[[1]]})) %>% 
+  gather(dataset, auc, train:test) %>% 
+  ggplot(aes(y = reorder(pathway, -auc), x = auc, color = dataset)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~n_train) +
+  theme(strip.background = element_rect(colour = "black", fill = "white", size = 1), 
+        axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 7, color = "black"), 
+        axis.text.y = element_text(size = 5, color = "black"), 
+        axis.title.x = element_text(size = 7, color = "black"), 
+        axis.title.y = element_text(size = 7, color = "black"), 
+        panel.background = element_rect(fill = "white", color = "black")) +
+  ylab("Pathways")
+```
+
+## overlap in top models
+
+```{r}
+overlap <- lapply(sapply(training, nrow), function(n){
+  topModels <- (pathways %>% 
+  filter(Term %in% (result %>% 
+                      mutate(pathway = rownames(.)) %>% 
+                      filter(train > 0.75, n_train == n) %>% 
+                      mutate(pathway = sapply(strsplit(pathway, "\\."), function(i){i[[1]]})))$pathway))$Genes
+  data.frame(overlap = sapply(topModels, function(i){ length(intersect(i, truth_genes))})) %>% 
+    mutate(pathway = rownames(.),
+           SSize = n) %>% 
+    mutate(pathway = sapply(strsplit(pathway, "_"), function(i){i[[1]]}))
+}) %>% 
+  do.call(rbind, .)
+
+
+
+overlap %>% 
+    ggplot(aes(y = reorder(pathway, -overlap), x = overlap)) +
+    geom_point() +
+  theme(strip.background = element_rect(colour = "black", fill = "white", size = 1), 
+        axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 7, color = "black"), 
+        axis.text.y = element_text(size = 5, color = "black"), 
+        axis.title.x = element_text(size = 7, color = "black"), 
+        axis.title.y = element_text(size = 7, color = "black"), 
+        panel.background = element_rect(fill = "white", color = "black"))+
+    ylab("Pathways")+
+    xlim(c(0,15)) +
+  facet_wrap(~SSize, scales = "free_y")
+
+```
+
